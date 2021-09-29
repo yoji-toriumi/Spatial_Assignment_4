@@ -1,30 +1,188 @@
 ---
-title: "Spatial_Assignment_4"
-author: "Yoji"
+title: "Assignment_4"
+author: "Yoji Toriumi"
 date: "9/28/2021"
 output: html_document
 ---
 
+## 
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+options(java.parameters = "-Xmx2G")
+
+library(r5r)
+library(osmextract)
+library(tidyverse)
+library(sf)
+library(ggthemes)
+library(ggspatial)
+library(tigris)
+library(wesanderson)
+library(tidytransit)
+library(jpndistrict) 
 ```
 
-## R Markdown
+## 
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r, results=FALSE}
+dir.create("networks")
 ```
 
-## Including Plots
+```{r, results=FALSE}
+# set a boundary. you need to install a package
+tokyo_file <- oe_match("Tokyo")
 
-You can also embed plots, for example:
+tokyo_streets <- oe_read(tokyo_file$url, 
+                         provider = "openstreetmap_fr", 
+                         download_directory = "networks", 
+                         layer = "lines", 
+                         quiet = TRUE) %>%
+  filter(!is.na(highway)) 
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+tokyo_boundary <-  jpn_pref(pref_code = 13)
+tokyo3_boundary <- jpn_cities(jis_code = c(13101, 13102, 13103))
+tokyo3_boundary <- tokyo3_boundary %>% 
+  st_transform(crs = st_crs((tokyo_streets))) 
+
+# set a plane in Japan
+japan_plane <- "+proj=tmerc +lat_0=44 +lon_0=142.25 +k=0.9999 +x_0=0 +y_0=0 +ellps=bessel +units=m +no_defs"
+
+# clipped streets
+tokyo_streets <- tokyo_streets[tokyo3_boundary, ]  
+
+# get a museum location from OSM
+tokyo_museum <- oe_read(tokyo_file$url,
+                        provider = "openstreetmap_fr",
+                        download_directory = "networks",
+                        layer = "points",
+                        quiet = TRUE) %>% 
+  filter(str_detect(other_tags, '"tourism"=>"museum"')) %>% 
+  st_filter(tokyo3_boundary) %>% 
+  rename(id = osm_id)
+
+# make a grid
+grid <- st_sf(st_make_grid(tokyo3_boundary, 
+                           square = FALSE, 
+                           n = c(100,100),
+                           what = "polygons")) %>%
+  st_filter(tokyo3_boundary) 
+
+colnames(grid) <- "geometry"
+st_geometry(grid) <- "geometry"
+
+grid <- grid %>%
+  mutate(id = seq(1, length(grid$geometry), by=1))
+
+grid_points <- st_centroid(grid)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## 
+
+```{r, results=FALSE}
+r5r_core <- setup_r5("networks", verbose = FALSE)
+
+ttm <- travel_time_matrix(r5r_core = r5r_core,
+                          origins = tokyo_museum,
+                          destinations = grid_points,
+                          mode = c("WALK", "TRANSIT"),
+                          departure_datetime = as.POSIXct("15-11-2021 14:00:00",
+                                                          format = "%d-%m-%Y %H:%M:%S"),
+                          max_walk_dist = 1000,
+                          max_trip_duration = 480,
+                          verbose = FALSE)
+
+tt_wide <- ttm %>%
+  pivot_wider(names_from = fromId, 
+              names_prefix = "from", values_from = travel_time) %>%
+  rename(id = toId) %>% 
+  merge(grid) %>%
+  replace(is.na(.), 999) %>%
+  rowwise() %>%
+  mutate(from_any = min(c_across(starts_with("from")), na.rm = TRUE))
+
+st_geometry(tt_wide) <- "geometry"
+
+iso_palette <- wes_palette("Darjeeling1", n = 5)
+
+iso_tokyo_5min <- tt_wide[tt_wide$from_any < 6, ] %>% 
+  st_union()
+
+iso_tokyo_10min <- tt_wide[tt_wide$from_any < 11, ] %>% 
+  st_union()
+
+iso_tokyo_15min <- tt_wide[tt_wide$from_any < 16, ] %>% 
+  st_union()
+
+ggplot(tokyo_streets) +
+  geom_sf(data = iso_tokyo_15min,
+          aes(fill = "Area within 15 minutes"),
+          color = NA) +
+  geom_sf(data = iso_tokyo_10min,
+          aes(fill = "Area within 10 minutes"),
+          color = NA) +
+  geom_sf(data = iso_tokyo_5min,
+          aes(fill = "Area within 5 minutes"),
+          color = NA) +
+  geom_sf(alpha = 1/2) +
+  scale_fill_manual(values = c(iso_palette[1],
+                               iso_palette[2],
+                               iso_palette[3]),
+                    name = "Transit travel \ntime to the \nnearest museum\n(minutes)") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tr", style = north_arrow_minimal()) +
+  theme_void() +
+  theme(legend.background = element_rect(color = "NA"))
+```
+
+## bus station
+
+```{r, results=FALSE}
+transit_stops <- oe_read(tokyo_file$url,
+                        provider = "openstreetmap_fr",
+                        download_directory = "networks",
+                        layer = "points",
+                        quiet = TRUE) %>% 
+  filter(str_detect(highway, "bus_stop")) %>% 
+  st_filter(tokyo3_boundary) %>% 
+  rename(id = osm_id)
+
+transit_grid <- grid %>% 
+  mutate(num_stops = lengths(st_covers(grid, transit_stops)))
+
+transit_points <- st_centroid(transit_grid)
+
+transit_access <- accessibility(r5r_core,
+                                origins = transit_points,
+                                destinations = transit_points,
+                                mode = "WALK",
+                                opportunities_colname = "num_stops",
+                                decay_function = "step",
+                                cutoffs = 11,
+                                departure_datetime = as.POSIXct("06-11-2021 14:00:00",
+                                                                format = "%d-%m-%Y %H:%M:%S"),
+                                max_walk_dist = 500,
+                                time_window = 60,
+                                percentiles = 50,
+                                verbose = FALSE) %>%
+  mutate(id = as.numeric(from_id)) %>%
+  merge(grid)
+
+st_geometry(transit_access) <- "geometry"
+
+ggplot(transit_access) +
+  geom_sf(aes(fill = accessibility), color = NA) +
+  scale_fill_viridis_c(name = "Transit stops\nwithin 10-minutes\nwalk") +
+  theme_void()
+```
+
+```{r, results=FALSE}
+
+```
+
+```{r, results=FALSE}
+
+```
+
+```{r, results=FALSE}
+
+```
